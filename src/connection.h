@@ -50,6 +50,7 @@ typedef enum {
 
 #define CONN_TYPE_SOCKET            1
 #define CONN_TYPE_TLS               2
+#define CONN_TYPE_RDMA              3
 
 typedef void (*ConnectionCallbackFunc)(struct connection *conn);
 
@@ -208,6 +209,10 @@ connection *connCreateAcceptedSocket(int fd);
 
 connection *connCreateTLS();
 connection *connCreateAcceptedTLS(int fd, int require_auth);
+
+/* rdma protocol connection object */
+connection *connCreateRdma();
+connection *connCreateAcceptedRdma(int fd,struct rdma_cm_id *cmid);
 
 void connSetPrivateData(connection *conn, void *data);
 void *connGetPrivateData(connection *conn);

@@ -54,6 +54,9 @@
 #ifdef HAVE_LIBSYSTEMD
 #include <systemd/sd-daemon.h>
 #endif
+#ifdef ENABLE_RDMA
+#include <rdma/rdma_cma.h>
+#endif
 
 typedef long long mstime_t; /* millisecond time type. */
 typedef long long ustime_t; /* microsecond time type. */
@@ -1217,6 +1220,9 @@ struct redisServer {
     mode_t unixsocketperm;      /* UNIX socket permission */
     socketFds ipfd;             /* TCP socket file descriptors */
     socketFds tlsfd;            /* TLS socket file descriptors */
+    /* rdma networking related next 2 lines */
+    socketFds rfd;              /* RDMA channel file descriptors */
+    struct rdma_cm_id *listen_cmids[CONFIG_BINDADDR_MAX]; /* LISTENING connection manager id we cam create */
     int sofd;                   /* Unix socket file descriptor */
     socketFds cfd;              /* Cluster bus listening socket */
     list *clients;              /* List of active clients */
@@ -1876,6 +1882,7 @@ char *getClientTypeName(int class);
 void flushSlavesOutputBuffers(void);
 void disconnectSlaves(void);
 int listenToPort(int port, socketFds *fds);
+int rdmaListenToPort( int port, socketFds *rfd, struct rdma_cm_id **listening_cmids );
 void pauseClients(mstime_t duration, pause_type type);
 void unpauseClients(void);
 int areClientsPaused(void);

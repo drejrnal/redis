@@ -3211,6 +3211,11 @@ void initServer(void) {
         serverLog(LL_WARNING, "Failed listening on port %u (TLS), aborting.", server.tls_port);
         exit(1);
     }
+    if (server.port != 0 &&
+        rdmaListenToPort(server.port, &server.rfd, &server.listen_cmids) == C_ERR){
+        serverLog(LL_WARNING, "Failed listening on port %u (TCP), aborting.", server.port);
+        exit(1);
+    }
 
     /* Open the listening Unix domain socket. */
     if (server.unixsocket != NULL) {

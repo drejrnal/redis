@@ -60,6 +60,9 @@ int anetTcpServer(char *err, int port, char *bindaddr, int backlog);
 int anetTcp6Server(char *err, int port, char *bindaddr, int backlog);
 int anetUnixServer(char *err, char *path, mode_t perm, int backlog);
 int anetTcpAccept(char *err, int serversock, char *ip, size_t ip_len, int *port);
+/* rdma accept decalration*/
+int netRdmaAccept(char *err, int s, char *ip, size_t ip_len, int *port, void **privdata);
+/* rdma accept end */
 int anetUnixAccept(char *err, int serversock);
 int anetNonBlock(char *err, int fd);
 int anetBlock(char *err, int fd);

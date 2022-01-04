@@ -1141,6 +1141,29 @@ void acceptTcpHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
     }
 }
 
+void acceptRdmaHandler( aeEventLoop *el, int fd, void *privdata, int mask ){
+    int cport, ret, max = MAX_ACCEPTS_PER_CALL;
+    char cip[NET_IP_STR_LEN];
+    struct rdma_cm_id *conn_cmid;
+    UNUSED(el);
+    UNUSED(mask);
+    UNUSED(privdata);
+
+    while( max-- ){
+        ret = netRdmaAccept(server.neterr, fd, cip, sizeof(cip), &cport, &conn_cmid);
+        if( ret == ANET_ERR ){
+            if(errno != EWOULDBLOCK)
+                serverLog(LL_WARNING,"Accept client connection: %s", server.neterr);
+            return;
+        }else if( ret == ANET_OK ){
+            continue;
+        }
+        anetCloexec(ret);
+        serverLog(LL_VERBOSE, "Accept connection from %s:%d", cip, cport);
+        acceptCommonHandler(connCreateAcceptedRdma(ret, conn_cmid), 0, cip);
+    }
+}
+
 void acceptTLSHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
     int cport, cfd, max = MAX_ACCEPTS_PER_CALL;
     char cip[NET_IP_STR_LEN];

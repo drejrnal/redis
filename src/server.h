@@ -1220,9 +1220,12 @@ struct redisServer {
     mode_t unixsocketperm;      /* UNIX socket permission */
     socketFds ipfd;             /* TCP socket file descriptors */
     socketFds tlsfd;            /* TLS socket file descriptors */
-    /* rdma networking related next 2 lines */
+    /* rdma protocol extension */
+    int rdma_port;
     socketFds rfd;              /* RDMA channel file descriptors */
     struct rdma_cm_id *listen_cmids[CONFIG_BINDADDR_MAX]; /* LISTENING connection manager id we cam create */
+    int rdma_replication;
+    /* rdma protocol extension declaration end */
     int sofd;                   /* Unix socket file descriptor */
     socketFds cfd;              /* Cluster bus listening socket */
     list *clients;              /* List of active clients */
@@ -1826,6 +1829,7 @@ void processGopherRequest(client *c);
 void acceptHandler(aeEventLoop *el, int fd, void *privdata, int mask);
 void acceptTcpHandler(aeEventLoop *el, int fd, void *privdata, int mask);
 void acceptTLSHandler(aeEventLoop *el, int fd, void *privdata, int mask);
+void acceptRdmaHandler(aeEventLoop *el, int fd, void *privdata, int mask);
 void acceptUnixHandler(aeEventLoop *el, int fd, void *privdata, int mask);
 void readQueryFromClient(connection *conn);
 void addReplyNull(client *c);

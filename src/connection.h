@@ -212,7 +212,7 @@ connection *connCreateAcceptedTLS(int fd, int require_auth);
 
 /* rdma protocol connection object */
 connection *connCreateRdma();
-connection *connCreateAcceptedRdma(int fd,struct rdma_cm_id *cmid);
+connection *connCreateAcceptedRdma(int fd,void *cmid);
 
 void connSetPrivateData(connection *conn, void *data);
 void *connGetPrivateData(connection *conn);

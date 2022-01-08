@@ -1144,7 +1144,7 @@ void acceptTcpHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
 void acceptRdmaHandler( aeEventLoop *el, int fd, void *privdata, int mask ){
     int cport, ret, max = MAX_ACCEPTS_PER_CALL;
     char cip[NET_IP_STR_LEN];
-    struct rdma_cm_id *conn_cmid;
+    void *conn_cmid;
     UNUSED(el);
     UNUSED(mask);
     UNUSED(privdata);
@@ -1159,7 +1159,7 @@ void acceptRdmaHandler( aeEventLoop *el, int fd, void *privdata, int mask ){
             continue;
         }
         anetCloexec(ret);
-        serverLog(LL_VERBOSE, "Accept connection from %s:%d", cip, cport);
+        serverLog(LL_DEBUG, "Accept connection from %s:%d", cip, cport);
         acceptCommonHandler(connCreateAcceptedRdma(ret, conn_cmid), 0, cip);
     }
 }

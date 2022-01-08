@@ -205,6 +205,8 @@ static struct config {
     char *hostsocket;
     int tls;
     cliSSLconfig sslconfig;
+    //install rdma configuration
+    int rdma;
     long repeat;
     long interval;
     int dbnum; /* db num currently selected */
@@ -865,15 +867,18 @@ static int cliConnect(int flags) {
             cliRefreshPrompt();
         }
 
+        if(config.rdma){
+            context = redisConnectRdma(config.hostip, config.hostport);
+        }
         /* Do not use hostsocket when we got redirected in cluster mode */
-        if (config.hostsocket == NULL ||
+        else if (config.hostsocket == NULL ||
             (config.cluster_mode && config.cluster_reissue_command)) {
             context = redisConnect(config.hostip,config.hostport);
         } else {
             context = redisConnectUnix(config.hostsocket);
         }
 
-        if (!context->err && config.tls) {
+        if (!context->err && config.tls && !config.rdma) {
             const char *err = NULL;
             if (cliSecureConnection(context, config.sslconfig, &err) == REDIS_ERR && err) {
                 fprintf(stderr, "Could not negotiate a TLS connection: %s\n", err);
@@ -1792,6 +1797,10 @@ static int parseOptions(int argc, char **argv) {
             config.sslconfig.ciphersuites = argv[++i];
         #endif
 #endif
+#ifdef USE_RDMA
+        } else if( !strcmp(argv[i], "--rdma") ){
+            config.rdma = 1;
+#endif
         } else if (!strcmp(argv[i],"-v") || !strcmp(argv[i], "--version")) {
             sds version = cliVersion();
             printf("redis-cli %s\n", version);
@@ -1929,6 +1938,9 @@ static void usage(void) {
 "                     See the ciphers(1ssl) manpage for more information about the syntax of this string,\n"
 "                     and specifically for TLSv1.3 ciphersuites.\n"
 #endif
+#endif
+#ifdef USE_RDMA
+"  --rdma             Establish a RDMA connection"
 #endif
 "  --raw              Use raw formatting for replies (default when STDOUT is\n"
 "                     not a tty).\n"

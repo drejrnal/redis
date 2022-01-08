@@ -258,6 +258,17 @@ endif
 	FINAL_LIBS += ../deps/hiredis/libhiredis_ssl.a $(LIBSSL_LIBS) $(LIBCRYPTO_LIBS)
 endif
 
+ifeq ($(BUILD_RDMA), yes)
+	FINAL_CFLAGS+=-DUSE_RDMA
+	RDMA_PKGCONFIG := $(shell $(PKG_CONFIG) --exists librdmacm libibverbs && echo $$?)
+	ifeq ($(RDMA_PKGCONFIG), 0)
+		RDMA_LIBS=$(shell $(PKG_CONFIG) --libs librdmacm libibverbs)
+	else
+		RDMA_LIBS=-lrdmacm -libverbs
+	endif
+	FINAL_LIBS += $(RDMA_LIBS)
+endif
+
 ifndef V
     define MAKE_INSTALL
         @printf '    %b %b\n' $(LINKCOLOR)INSTALL$(ENDCOLOR) $(BINCOLOR)$(1)$(ENDCOLOR) 1>&2
@@ -316,6 +327,9 @@ persist-settings: distclean
 	echo OPT=$(OPT) >> .make-settings
 	echo MALLOC=$(MALLOC) >> .make-settings
 	echo BUILD_TLS=$(BUILD_TLS) >> .make-settings
+	echo BUILD_RDMA=$(BUILD_RDMA) >> .make-settings
+	echo RDMA_PKGCONFIG=$(RDMA_PKGCONFIG) >> .make-settings
+	echo RDMA_LIBS=$(RDMA_LIBS) >> .make-settings
 	echo USE_SYSTEMD=$(USE_SYSTEMD) >> .make-settings
 	echo CFLAGS=$(CFLAGS) >> .make-settings
 	echo LDFLAGS=$(LDFLAGS) >> .make-settings

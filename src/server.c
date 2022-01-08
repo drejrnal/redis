@@ -3211,11 +3211,12 @@ void initServer(void) {
         serverLog(LL_WARNING, "Failed listening on port %u (TLS), aborting.", server.tls_port);
         exit(1);
     }
-    if (server.port != 0 &&
-        rdmaListenToPort(server.port, &server.rfd, &server.listen_cmids) == C_ERR){
+    if (server.rdma_port != 0 &&
+        rdmaListenToPort(server.rdma_port, &server.rfd, server.listen_cmids) == C_ERR){
         serverLog(LL_WARNING, "Failed listening on port %u (TCP), aborting.", server.port);
         exit(1);
     }
+    serverLog(LL_VERBOSE, "Redis server listening channel fd:%d, listening cmid:%p", server.rfd.fd[0], server.listen_cmids[0]);
 
     /* Open the listening Unix domain socket. */
     if (server.unixsocket != NULL) {
@@ -3231,7 +3232,7 @@ void initServer(void) {
     }
 
     /* Abort if there are no listening sockets at all. */
-    if (server.ipfd.count == 0 && server.tlsfd.count == 0 && server.sofd < 0) {
+    if (server.ipfd.count == 0 && server.tlsfd.count == 0 && server.sofd < 0 && server.rfd.count == 0 ) {
         serverLog(LL_WARNING, "Configured to not listen anywhere, exiting.");
         exit(1);
     }
@@ -3315,6 +3316,9 @@ void initServer(void) {
     }
     if (createSocketAcceptHandler(&server.tlsfd, acceptTLSHandler) != C_OK) {
         serverPanic("Unrecoverable error creating TLS socket accept handler.");
+    }
+    if (createSocketAcceptHandler(&server.rfd, acceptRdmaHandler) != C_OK) {
+        serverPanic("Unrecoverable error creating RDMA accept handler.");
     }
     if (server.sofd > 0 && aeCreateFileEvent(server.el,server.sofd,AE_READABLE,
         acceptUnixHandler,NULL) == AE_ERR) serverPanic("Unrecoverable error creating server.sofd file event.");

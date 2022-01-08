@@ -40,6 +40,7 @@
 
 #include "hiredis.h"
 #include "net.h"
+#include "rdma.h"
 #include "sds.h"
 #include "async.h"
 #include "win32.h"
@@ -714,7 +715,11 @@ static redisContext *redisContextInit(void) {
 void redisFree(redisContext *c) {
     if (c == NULL)
         return;
-    redisNetClose(c);
+    
+    if(c->funcs->close){
+        c->funcs->close(c);
+    }else
+        redisNetClose(c);
 
     hi_sdsfree(c->obuf);
     redisReaderFree(c->reader);
@@ -825,7 +830,12 @@ redisContext *redisConnectWithOptions(const redisOptions *options) {
     } else if (options->type == REDIS_CONN_USERFD) {
         c->fd = options->endpoint.fd;
         c->flags |= REDIS_CONNECTED;
-    } else {
+    } else if( options->type == REDIS_CONN_RDMA){
+        redisContextConnectRdma(c, options->endpoint.tcp.ip,
+                                    options->endpoint.tcp.port, options->connect_timeout);
+    
+    } 
+    else {
         // Unknown type - FIXME - FREE
         return NULL;
     }
@@ -895,6 +905,19 @@ redisContext *redisConnectUnixNonBlock(const char *path) {
     redisOptions options = {0};
     REDIS_OPTIONS_SET_UNIX(&options, path);
     options.options |= REDIS_OPT_NONBLOCK;
+    return redisConnectWithOptions(&options);
+}
+
+redisContext *redisConnectRdma(const char *ip, int port ){
+    redisOptions options = {0};
+    REDIS_OPTIONS_SET_RDMA(&options, ip, port);
+    return redisConnectWithOptions(&options);
+}
+
+redisContext *redisConnectRdmaWithTimeout(const char *ip, int port, const struct timeval tv){
+    redisOptions options = {0};
+    REDIS_OPTIONS_SET_RDMA(&options, ip, port);
+    options.connect_timeout = &tv;
     return redisConnectWithOptions(&options);
 }
 

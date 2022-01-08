@@ -82,7 +82,10 @@ ifeq ($(uname_S),Linux)
     SSL_LDFLAGS+=-L$(OPENSSL_PREFIX)/lib -lssl -lcrypto
   else
     SSL_LDFLAGS=-lssl -lcrypto
-	REAL_CFLAGS+=-lrdmacm -libverbs
+  endif
+  ifeq ($(BUILD_RDMA), yes)
+	CFLAGS+=-DUSE_RDMA
+	REAL_LDFLAGS+=-lrdmacm -libverbs
   endif
 else
   OPENSSL_PREFIX?=/usr/local/opt/openssl

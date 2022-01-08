@@ -6,13 +6,17 @@
  * 
  * @copyright Copyright (c) 2021
  */
-
+#include "fmacros.h"
 #include "server.h"
 #include "connhelpers.h"
-#include <infiniband/verbs.h>
-#include <rdma/rdma_cma.h>
 #include <stdbool.h>
 
+#ifdef USE_RDMA
+#ifdef __linux__
+#include <infiniband/verbs.h>
+#include <arpa/inet.h>
+#include <rdma/rdma_cma.h>
+#include <assert.h>
 #define REDIS_MAX_SGE 1024
 #define REDIS_SYNC_MS 10
 #define MIN(a, b)  \
@@ -103,6 +107,8 @@ struct rdmaContext
      */
     rdmaCommand *cmd_buf;
     struct ibv_mr *cmd_region;
+    /* selective signaling */
+    uint32_t send_ops;
 };
 
 
@@ -145,12 +151,12 @@ static int rdmaPostRecv( rdmaContext *ctx, struct rdma_cm_id *cmid, rdmaCommand 
     int ret = C_OK;
 
     struct ibv_recv_wr wr, *bad_wr;
-    struct ibv_sge *sgl;
+    struct ibv_sge sgl;
     memset(&wr, 0, sizeof(wr));
     /* each node maintain a command buffer which used to receive comnmand */
-    sgl->addr = (uint64_t)cmd;
-    sgl->length = sizeof(rdmaCommand);
-    sgl->lkey = ctx->cmd_region->lkey;
+    sgl.addr = (uint64_t)cmd;
+    sgl.length = sizeof(rdmaCommand);
+    sgl.lkey = ctx->cmd_region->lkey;
 
     wr.num_sge = 1;
     wr.wr_id = (uint64_t)(cmd);
@@ -245,11 +251,20 @@ static int connRdmaWait( connection *c, long long start, long long timeout){
     return C_OK;
 }
 
-static int connRdmaConnect(connection *c, const char *addr, int port, const char *src_addr){
+static int connRdmaConnect(connection *c, const char *addr, int port, const char *src_addr, ConnectionCallbackFunc connect_handler){
+    UNUSED(c);
+    UNUSED(addr);
+    UNUSED(port);
+    UNUSED(src_addr);
+    UNUSED(connect_handler);
     serverLog(LL_WARNING, "Redis server call connect in RDMA context");
     return C_ERR;
 }
-static int connRdmaBlockingConnect(connection *c, const char *addr, int port, long timeout){
+static int connRdmaBlockingConnect(connection *c, const char *addr, int port, long long timeout){
+    UNUSED(c);
+    UNUSED(addr);
+    UNUSED(port);
+    UNUSED(timeout);
     serverLog(LL_WARNING, "Redis server call blocking connect in RDMA context");
     return C_ERR;
 }
@@ -281,7 +296,7 @@ static int rdmaSendCommand( rdmaContext *ctx, struct rdma_cm_id *cmid, rdmaComma
     send_cmd->used = 1;
     send_cmd->version = 1;
 
-    sgl.addr = &send_cmd;
+    sgl.addr = (uint64_t)send_cmd;
     sgl.length = sizeof(rdmaCommand);
     
     wr.num_sge = 1;
@@ -341,16 +356,18 @@ static int ibVerbsWrite(connection *c, size_t write_len){
     wr.wr_id = 0;
     wr.imm_data = htonl(0);
 
-    wr.wr.rdma.remote_addr = ctx->remote_buffer + offset;
+    wr.wr.rdma.remote_addr = (uint64_t)ctx->remote_buffer + offset;
     wr.wr.rdma.rkey = ctx->remote_key;
     
     wr.opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
-    wr.send_flags |= IBV_SEND_SIGNALED; //todo::selective signaled
+    //wr.send_flags |= IBV_SEND_SIGNALED; 
+    //selective signaled
+    wr.send_flags = ((++ctx->send_ops) % REDIS_MAX_SGE) ? 0 : IBV_SEND_SIGNALED; 
 
     ret = ibv_post_send( cmid->qp, &wr, &bad_wr );
     if( ret ){
         rdma_conn->conn.last_errno = errno;
-        serverLog(LL_WARNING, "RDMA: WRITE failed:%s", connGetLastError(errno));
+        serverLog(LL_WARNING, "RDMA: WRITE failed:%s", connGetLastError(c));
         if( rdma_conn->conn.state == CONN_STATE_CONNECTED )
             rdma_conn->conn.state = CONN_STATE_ERROR;
         return ret;
@@ -427,7 +444,7 @@ static ssize_t connRdmaSyncWrite(connection *c, char *ptr, ssize_t size, long lo
         remain_time -=(mstime() - start);
     }
     if( nwritten != size ){
-        serverLog(LL_WARNING, "Redis server sync write data tiemout written %d amount of data", nwritten);
+        serverLog(LL_WARNING, "Redis server sync write data tiemout written %ld amount of data", nwritten);
         return C_ERR;
     }
     return nwritten;
@@ -531,6 +548,7 @@ static const char *connRdmaGetLastError(connection *conn){
  */
 static int rdmaHandleRecv( rdmaContext *ctx,struct rdma_cm_id *cmid, rdmaCommand *cmd ){
     int ret = 0;
+    UNUSED(cmid);
 
     uint64_t addr = ntohu64(cmd->addr);
     uint32_t rkey = ntohl(cmd->rkey);
@@ -539,7 +557,7 @@ static int rdmaHandleRecv( rdmaContext *ctx,struct rdma_cm_id *cmid, rdmaCommand
     switch (cmd->opcode)
     {
     case REGISTER_LOCAL_ADDR:
-        ctx->remote_buffer = addr;
+        ctx->remote_buffer = (char *)addr;
         ctx->remote_key = rkey;
         ctx->tx_offset = 0;
         ctx->tx_length = length;
@@ -558,6 +576,7 @@ static void rdmaHandleSend( rdmaCommand *cmd ){
     cmd->used = 0;
 }
 static int rdmaHandleWrite( int byte_len ){
+    UNUSED(byte_len);
     serverLog(LL_DEBUG, "Redis server write %d amount of data via rdma", byte_len);
     return C_OK;
 }
@@ -572,6 +591,7 @@ static int rdmaHandleRecvIMM(rdmaContext *ctx, struct rdma_cm_id *cmid, rdmaComm
 static int rdmaHandleCq(rdmaConnection *rdma_conn){
     int ret = C_OK;
 
+    rdmaCommand *cmd = NULL;
     struct rdma_cm_id *cmid = rdma_conn->cm_id;
     rdmaContext *ctx = (rdmaContext *)cmid->context;
     struct ibv_comp_channel *comp_channel = ctx->comp_channel;
@@ -583,20 +603,20 @@ static int rdmaHandleCq(rdmaConnection *rdma_conn){
         if( errno != EAGAIN ){
             ret = C_ERR;
             rdma_conn->conn.last_errno = errno;        
-            serverLog(LL_WARNING, "get event notification from comp channel failed:%s", connGetLastError(errno) );
+            serverLog(LL_WARNING, "get event notification from comp channel failed:%s", connGetLastError(&rdma_conn->conn) );
             return ret;
         }
     }
-    if(ret = (ibv_req_notify_cq(cq, 0)) ){
+    if( ibv_req_notify_cq(cq, 0) ){
         ret = C_ERR;
         rdma_conn->conn.last_errno = errno;
-        serverLog(LL_WARNING, "rearmed notification for cq failed:%s", connGetLastError(errno));
+        serverLog(LL_WARNING, "rearmed notification for cq failed:%s", connGetLastError(&rdma_conn->conn));
         return ret;
     }
 
     struct ibv_wc wc[REDIS_MAX_SGE * 2];
-    int cq_events = 0, tmp = 0;
-    cq_events = ibv_poll_cq(cq, REDIS_MAX_SGE * 2, &wc);
+    int cq_events = 0;
+    cq_events = ibv_poll_cq(cq, REDIS_MAX_SGE * 2, wc);
     if( cq_events == 0 ){
         return C_OK;   
     }
@@ -606,7 +626,7 @@ static int rdmaHandleCq(rdmaConnection *rdma_conn){
         switch (wc[i].opcode)
         {
         case IBV_WC_RECV_RDMA_WITH_IMM:
-            rdmaCommand *cmd = (rdmaCommand *)(wc[i].wr_id);
+            cmd = (rdmaCommand *)(wc[i].wr_id);
             if (rdmaHandleRecvIMM(ctx,cmid, cmd, wc[i].byte_len)){
                 rdma_conn->conn.state = CONN_STATE_ERROR;
                 return C_ERR;
@@ -615,18 +635,18 @@ static int rdmaHandleCq(rdmaConnection *rdma_conn){
             break;
 
         case IBV_WC_RECV:
-            rdmaCommand *cmd = (rdmaCommand *)(wc[i].wr_id);
+            cmd = (rdmaCommand *)(wc[i].wr_id);
             if (rdmaHandleRecv(ctx, cmid, cmd)){
                 rdma_conn->conn.state = CONN_STATE_ERROR;
                 return C_ERR;
             }
-            serverLog(LL_VERBOSE, "Redis server receive command with from client with recv buffer:%x", ntohu64(cmd->addr));
+            serverLog(LL_VERBOSE, "Redis server receive command with from client with recv buffer:%lx", ntohu64(cmd->addr));
             break;
 
         case IBV_WC_SEND:
-            rdmaCommand *cmd = (rdmaCommand *)(wc[i].wr_id);
+            cmd = (rdmaCommand *)(wc[i].wr_id);
             rdmaHandleSend(cmd);
-            serverLog(LL_VERBOSE, "Redis server send command with recv buffer addr %x, length %d", ntohu64(cmd->addr), ntohl(cmd->length));
+            serverLog(LL_VERBOSE, "Redis server send command with recv buffer addr %lx, length %d", ntohu64(cmd->addr), ntohl(cmd->length));
             break;
         case IBV_WC_RDMA_WRITE:
             rdmaHandleWrite(wc[i].byte_len);
@@ -665,16 +685,20 @@ static int rdmaHandleCq(rdmaConnection *rdma_conn){
 } 
 
 static void connRdmaEventHandler(struct aeEventLoop *el, int fd, void *clientData, int mask ){
+    UNUSED(el);
+    UNUSED(fd);
 
     rdmaConnection *rdma_conn = (rdmaConnection *)(clientData);
     connection *conn = &rdma_conn->conn;
     rdmaContext *ctx = (rdmaContext *)rdma_conn->cm_id->context;
 
-    if(rdmaHandleCq( rdma_conn ) == C_ERR)
-        return C_ERR;
+    if(rdmaHandleCq( rdma_conn ) == C_ERR){
+        rdma_conn->conn.state = CONN_STATE_ERROR;
+        return;
+    }
 
     int call_read = (mask & AE_READABLE) && conn->read_handler;
-    int call_write = (conn->write_handler != NULL);
+    //int call_write = (conn->write_handler != NULL);
     if( call_read ){
         while( ctx->recv_offset < ctx->rx_offset ){
             if(!callHandler(conn, conn->read_handler)) return;
@@ -703,8 +727,10 @@ static void connRdmaEventHandler(struct aeEventLoop *el, int fd, void *clientDat
 
 int connRdmaCron(struct aeEventLoop *eventLoop, long long id, void *clientData){
 
+    UNUSED(id);
+
     connection *c = (connection *)(clientData);
-    rdmaConnection *rdma_conn = (rdmaConnection *)(c);
+    
     if( c->state != CONN_STATE_CONNECTED )
         return REDIS_SYNC_MS;
     //rdmaHandleCq(c);
@@ -719,7 +745,7 @@ static int connRdmaSetIOHandler(connection *c){
     rdmaContext *ctx = (rdmaContext *)(cmid->context);
     
     //install connection object into rdmaContext
-    ctx->connection = c;
+    ctx->connection = rdma_conn;
 
     if( c->read_handler || c->write_handler ){
         if(aeCreateFileEvent(server.el, c->fd, AE_READABLE, c->type->ae_handler, c) == AE_ERR)
@@ -785,16 +811,17 @@ static int connRdmaAccept(connection *c, ConnectionCallbackFunc accept_handler )
  */
 connection *connCreateRdma(){
     rdmaConnection *rdma_conn = zcalloc(sizeof(rdmaConnection));
-    rdma_conn->conn.type = CONN_TYPE_RDMA;
+    rdma_conn->conn.type = &CT_rdma;
     rdma_conn->conn.fd = -1;
-    return rdma_conn;
+
+    return (connection *)rdma_conn;
 }
-connection *connCreateAcceptedRdma(int fd, struct rdma_cm_id *cmid){
-    rdmaConnection *rdma_conn = (rdmaConnection *)(connCreateRdma);
+connection *connCreateAcceptedRdma(int fd, void *privdata){
+    rdmaConnection *rdma_conn = (rdmaConnection *)connCreateRdma();
     rdma_conn->conn.fd = fd;
     rdma_conn->conn.state = CONN_STATE_ACCEPTING;
-    rdma_conn->cm_id = cmid;
-    return rdma_conn;
+    rdma_conn->cm_id = (struct rdma_cm_id *)privdata;
+    return (connection *)rdma_conn;
 }
 
 int createRdmaConnResources(rdmaContext *ctx,struct rdma_cm_id *cm_id ){
@@ -850,7 +877,7 @@ int createRdmaConnResources(rdmaContext *ctx,struct rdma_cm_id *cm_id ){
 
 
 freeqp:
-    rdma_destroy_qp(cm_id->qp);
+    ibv_destroy_qp(cm_id->qp);
 freeresources:
     if (ctx->cq)
         ibv_destroy_cq(ctx->cq);
@@ -921,16 +948,21 @@ freectx:
 static int rdmaHandleEstablished( struct rdma_cm_event *event){
     struct rdma_cm_id *cmid = event->id;
     rdmaContext *ctx = (rdmaContext *)(cmid->context);
-    if(syncRecvBuffer( ctx, cmid ))
+    serverLog(LL_DEBUG, "Redis server accept connection from peer node");
+    if(syncRecvBuffer( ctx, cmid )){
+        serverLog(LL_WARNING, "Redis server send memory region information failed[qp number:%d]", cmid->qp->qp_num);
         return C_ERR;
+    }
+    serverLog(LL_DEBUG, "Redis server send memory region information via qp number %d", cmid->qp->qp_num);
     return C_OK;
 }
 //handle DISCONNECTED
 static int rdmaHandleDisconnection( struct rdma_cm_event *event ){
     struct rdma_cm_id *cmid = event->id;
     rdmaContext *ctx = (rdmaContext *)(cmid->context);
-    connection *conn = ctx->connection;
+    connection *conn = (connection *)ctx->connection;
     
+    serverLog(LL_DEBUG, "Redis server receive diconnection from peer node");
     conn->state = CONN_STATE_CLOSED;
     if( conn->read_handler != NULL )
         callHandler(conn, conn->read_handler);
@@ -964,7 +996,8 @@ static void connRdmaClose( connection *conn ){
         serverLog(LL_WARNING, "rdma_disconnect failed:%s", strerror(errno));
 
     redisRdmaFree(ctx);
-
+    cmid->context = NULL;
+    
     if( cmid->qp )
         ibv_destroy_qp(cmid->qp);
     rdma_destroy_id(cmid);
@@ -1007,6 +1040,9 @@ ConnectionType CT_rdma = {
  * @return: 新的连接建立后对应的completion channel对应的fd
  */
 int netRdmaAccept(char *err, int s, char *ip, size_t ip_len,int *port, void **privdata ){
+    UNUSED(err);
+    UNUSED(s);
+    
     int ret = C_OK;
     struct rdma_cm_event *event;
     if( rdma_get_cm_event(listen_channel, &event) == -1 ){
@@ -1028,6 +1064,8 @@ int netRdmaAccept(char *err, int s, char *ip, size_t ip_len,int *port, void **pr
         ret = rdmaHandleEstablished( event );
         if( ret == C_ERR )
             ret = ANET_ERR;
+        else
+            ret = ANET_OK;
         break;
     case RDMA_CM_EVENT_CONNECT_ERROR:
     case RDMA_CM_EVENT_REJECTED:
@@ -1041,11 +1079,39 @@ int netRdmaAccept(char *err, int s, char *ip, size_t ip_len,int *port, void **pr
         break;
 
     default:
+        ret = ANET_ERR;
         break;
     }
     if( rdma_ack_cm_event(event)== -1){
+        serverLog(LL_WARNING, "Redis server ack listening event failed");
         return ANET_ERR;
     }
     
     return ret;
 }
+
+#else
+"Build error, RDMA related library should be run on linux platform"
+#endif
+#else
+
+int netRdmaAccept(char *err, int s, char *ip, size_t ip_len,int *port, void **privdata ){
+    UNUSED(err);
+    UNUSED(s);
+    UNUSED(ip);
+    UNUSED(ip_len);
+    UNUSED(port);
+    UNUSED(privdata);
+    fprintf(stderr, "Build with RDMA failed, need option declaration BUILD_RDMA=yes");
+    errno = EOPNOTSUPP;
+    return ANET_ERR;
+}
+
+connection *connCreateAcceptedRdma(int fd, void *privdata){
+    UNUSED(fd);
+    UNUSED(privdata);
+    fprintf(stderr, "Build with RDMA failed, need option declaration BUILD_RDMA=yes");
+    errno = EOPNOTSUPP;
+    return NULL;
+}
+#endif

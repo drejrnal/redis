@@ -135,7 +135,8 @@ void redisFreeSdsCommand(hisds cmd);
 enum redisConnectionType {
     REDIS_CONN_TCP,
     REDIS_CONN_UNIX,
-    REDIS_CONN_USERFD
+    REDIS_CONN_USERFD,
+    REDIS_CONN_RDMA
 };
 
 struct redisSsl;
@@ -221,6 +222,12 @@ typedef struct {
     (opts)->privdata = data;                         \
     (opts)->free_privdata = dtor;                    \
 
+#define REDIS_OPTIONS_SET_RDMA(opts, ip_, port_) \
+    (opts)->type = REDIS_CONN_RDMA; \
+    (opts)->endpoint.tcp.ip = ip_; \
+    (opts)->endpoint.tcp.port = port_;
+
+
 typedef struct redisContextFuncs {
     void (*close)(struct redisContext *);
     void (*free_privctx)(void *);
@@ -265,7 +272,7 @@ typedef struct redisContext {
     void (*free_privdata)(void *);
 
     /* Internal context pointer presently used by hiredis to manage
-     * SSL connections. */
+     * SSL/RDMA connections. */
     void *privctx;
 
     /* An optional RESP3 PUSH handler */
@@ -283,6 +290,10 @@ redisContext *redisConnectBindNonBlockWithReuse(const char *ip, int port,
 redisContext *redisConnectUnix(const char *path);
 redisContext *redisConnectUnixWithTimeout(const char *path, const struct timeval tv);
 redisContext *redisConnectUnixNonBlock(const char *path);
+/* Redis connect via RDMA function declaration */
+redisContext *redisConnectRdma(const char *ip, int port );
+redisContext *redisConnectRdmaWithTimeout(const char *ip, int port, const struct timeval tv);
+/* Redis connect via RDMA function end */
 redisContext *redisConnectFd(redisFD fd);
 
 /**

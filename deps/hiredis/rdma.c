@@ -12,13 +12,29 @@
  */
 #include "fmacros.h" //for struct addrinfo declaration
 #include "async.h"
+#include "async_private.h"
 #include "hiredis.h"
-#include <poll.h>
+#include "rdma.h"
+#include <errno.h>
+
+
+#define UNUSED(V) ((void) V)
+void __redisSetError(redisContext *c, int type, const char *str);
+
+#ifdef USE_RDMA
+#ifdef __linux__
+#define __USE_MISC
+
+#include <endian.h>
 #include <netdb.h>
-#include <sys/socket.h>
+#include <poll.h>
 #include <arpa/inet.h>
-#include <infiniband/verbs.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <unistd.h>
 #include <limits.h>
+#include <infiniband/verbs.h>
+#include <assert.h>
 #include <rdma/rdma_cma.h>
 
 #define REDIS_MAX_SGE 1024
@@ -84,12 +100,13 @@ typedef struct rdmaContext
      */
     rdmaCommand *cmd_buf;
     struct ibv_mr *cmd_region;
+    /* selective signaled */
+    uint32_t send_ops;
 }rdmaContext;
 
 /* forward declaration */
 redisContextFuncs redisContextRdmaFuncs;
 
-void __redisSetError(redisContext *c, int type, const char *str);
 int redisContextTimeoutMsec(redisContext *c, long *result);
 int redisContextUpdateConnectTimeout(redisContext *c, const struct timeval *timeout);
 int redisSetFdBlocking(redisContext *c, int fd, int blocking);
@@ -100,17 +117,17 @@ int redisSetFdBlocking(redisContext *c, int fd, int blocking);
 /* 将struct timeval转换为long表示的msec */
 static int redisCommandTimeoutMsec(redisContext *c, long *result){
     const struct timeval *timeout = c->command_timeout;
-    long msec = INT_MAX;
+    long msec = INT32_MAX;
 
     if( timeout != NULL ){
-        if (timeout->tv_usec >= 1000000 || timeout->tv_sec > __MAX_SEC){
+        if (timeout->tv_usec >= 1000000 || (timeout->tv_sec > __MAX_SEC) ){
             *result = msec;
             return REDIS_ERR;
         }
 
         msec = (timeout->tv_sec * 1000) + ((timeout->tv_usec + 999) / 1000);
-        if (msec < 0 || msec > INT_MAX){
-            msec = INT_MAX;
+        if (msec < 0 || msec > INT32_MAX){
+            msec = INT32_MAX;
         }
     }
 
@@ -118,11 +135,11 @@ static int redisCommandTimeoutMsec(redisContext *c, long *result){
     return REDIS_OK;
 }
 
-static long redisNow(){
-    struct timeval *tval;
-    if(gettimeofday(tval, NULL) < 0)
+static inline long redisNow(){
+    struct timeval tval;
+    if(gettimeofday(&tval, NULL) < 0)
         return -1;
-    return tval->tv_sec * 1000 + (tval->tv_usec+999)/1000;
+    return tval.tv_sec * 1000 + (tval.tv_usec+999)/1000;
 }
 
 /*
@@ -133,12 +150,12 @@ static long redisNow(){
 static int rdmaPostRecv( rdmaContext *ctx, struct rdma_cm_id *cmid, rdmaCommand *cmd ){
     int ret = REDIS_OK;
     struct ibv_recv_wr wr, *bad_wr;
-    struct ibv_sge *sgl;
+    struct ibv_sge sgl;
     memset(&wr, 0, sizeof(wr));
     /* each node maintain a command buffer which used to receive comnmand */
-    sgl->addr = (uint64_t)cmd;
-    sgl->length = sizeof(rdmaCommand);
-    sgl->lkey = ctx->cmd_region->lkey;
+    sgl.addr = (uint64_t)cmd;
+    sgl.length = sizeof(rdmaCommand);
+    sgl.lkey = ctx->cmd_region->lkey;
 
     wr.num_sge = 1;
     wr.wr_id = (uint64_t)(cmd);
@@ -182,7 +199,7 @@ static int rdmaSetupIOBuffer(redisContext *c, rdmaContext *ctx, struct rdma_cm_i
     int access_flags = 0;
     access_flags = IBV_ACCESS_LOCAL_WRITE;
     int cmd_len = REDIS_MAX_SGE * 2 * sizeof(rdmaCommand);
-    ctx->cmd_buf = (rdmaCommand *)zcalloc(cmd_len);
+    ctx->cmd_buf = (rdmaCommand *)hi_calloc(1, cmd_len);
     ctx->cmd_region = ibv_reg_mr(ctx->pd, ctx->cmd_buf, cmd_len,access_flags);
     if( !ctx->cmd_region ){
         __redisSetError(c, REDIS_ERR_OTHER, "Redis client register command region failed");
@@ -197,7 +214,7 @@ static int rdmaSetupIOBuffer(redisContext *c, rdmaContext *ctx, struct rdma_cm_i
     }
     
     ctx->recv_length = RDMA_DEFAULT_RECV_LEN;
-    ctx->recv_buffer = zcalloc(ctx->recv_length);
+    ctx->recv_buffer = hi_calloc(1, ctx->recv_length);
     access_flags = (IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
     ctx->recv_region = ibv_reg_mr(ctx->pd, ctx->recv_buffer, ctx->recv_length, access_flags);
     if( !ctx->recv_region ){
@@ -220,18 +237,18 @@ static int rdmaAdjustSendBuffer(rdmaContext *ctx, int length ){
     if(ibv_dereg_mr(ctx->send_region)){
         ret = REDIS_ERR;
     }
-    zfree(ctx->send_buffer);
+    hi_free(ctx->send_buffer);
     ctx->send_buffer = NULL;
     ctx->send_length = 0;
     if( ret == REDIS_ERR )
         return ret;
 
     ctx->send_length = length;
-    ctx->send_buffer = zcalloc(length);
+    ctx->send_buffer = hi_calloc(1, length);
     ctx->send_region = ibv_reg_mr(ctx->pd, ctx->send_buffer,
                                   length, access_flags);
     if( !ctx->send_region ){
-        zfree(ctx->send_buffer);
+        hi_free(ctx->send_buffer);
         ctx->send_length = 0;
         ctx->send_buffer = NULL;
         ret = REDIS_ERR;
@@ -246,14 +263,14 @@ static int rdmaAdjustSendBuffer(rdmaContext *ctx, int length ){
  */ 
 static int rdmaHandleRecv( rdmaContext *ctx, rdmaCommand *cmd ){
     int ret = REDIS_OK;
-    uint64_t addr = ntohu64(cmd->addr);
+    uint64_t addr = be64toh(cmd->addr);
     uint32_t rkey = ntohl(cmd->rkey);
     uint32_t length = ntohl(cmd->length);
 
     switch (cmd->opcode)
     {
     case REGISTER_LOCAL_ADDR:
-        ctx->remote_buffer = addr;
+        ctx->remote_buffer = (char *)addr;
         ctx->remote_key = rkey;
         ctx->tx_offset = 0;
         ctx->tx_length = length;
@@ -272,10 +289,11 @@ static void rdmaHandleSend( rdmaCommand *cmd ){
     cmd->used = 0;
 }
 static int rdmaHandleWrite( int byte_len ){
+    UNUSED(byte_len);
     return REDIS_OK;
 }
 static int rdmaHandleRecvIMM(rdmaContext *ctx,rdmaCommand *cmd, int offset){
-    serverAssert(ctx->rx_offset + offset <= ctx->recv_length);
+    assert(ctx->rx_offset + offset <= ctx->recv_length);
     ctx->rx_offset +=offset;
     return rdmaPostRecv(ctx, ctx->cmid, cmd);
 }
@@ -284,6 +302,7 @@ static int rdmaHandleRecvIMM(rdmaContext *ctx,rdmaCommand *cmd, int offset){
 static int rdmaHandleCq(rdmaContext *ctx){
     int ret = REDIS_OK;
 
+    rdmaCommand *cmd = NULL;
     struct ibv_comp_channel *comp_channel = ctx->comp_channel;
     struct ibv_cq *cq = ctx->cq;
 
@@ -295,15 +314,15 @@ static int rdmaHandleCq(rdmaContext *ctx){
             return ret;
         }
     }
-    if(ret = (ibv_req_notify_cq(cq, 0)) ){
+    if( ibv_req_notify_cq(cq, 0) ){
         ret = REDIS_ERR;
         return ret;
     }
 
     struct ibv_wc wc[REDIS_MAX_SGE * 2];
 
-    int cq_events = 0, tmp = 0;
-    cq_events = ibv_poll_cq(cq, REDIS_MAX_SGE*2, &wc);
+    int cq_events = 0;
+    cq_events = ibv_poll_cq(cq, REDIS_MAX_SGE*2, wc);
     if( cq_events == 0 ){
         return ret;   
     }
@@ -311,20 +330,20 @@ static int rdmaHandleCq(rdmaContext *ctx){
     for( int i = 0; i < cq_events; i++ ){
         switch (wc[i].opcode){
         case IBV_WC_RECV_RDMA_WITH_IMM:
-            rdmaCommand *cmd = (rdmaCommand *)(wc[i].wr_id);
+            cmd = (rdmaCommand *)(wc[i].wr_id);
             if (rdmaHandleRecvIMM(ctx, cmd, wc[i].byte_len) == REDIS_ERR){
                 return REDIS_ERR;
             }
             break;
 
         case IBV_WC_RECV:
-            rdmaCommand *cmd = (rdmaCommand *)(wc[i].wr_id);
+            cmd = (rdmaCommand *)(wc[i].wr_id);
             if (rdmaHandleRecv(ctx, cmd) == REDIS_ERR ){
                 return REDIS_ERR;
             }
             break;
         case IBV_WC_SEND:
-            rdmaCommand *cmd = (rdmaCommand *)(wc[i].wr_id);
+            cmd = (rdmaCommand *)(wc[i].wr_id);
             rdmaHandleSend(cmd);
             break;
         case IBV_WC_RDMA_WRITE:
@@ -352,7 +371,7 @@ static int rdmaSendCommand( rdmaContext *ctx,struct rdma_cm_id *cmid, rdmaComman
         }
     }
 
-    send_cmd->addr = htonu64(cmd->addr);
+    send_cmd->addr = htobe64(cmd->addr);
     send_cmd->length = htonl(cmd->length);
     send_cmd->rkey = htonl(cmd->rkey);
 
@@ -360,7 +379,7 @@ static int rdmaSendCommand( rdmaContext *ctx,struct rdma_cm_id *cmid, rdmaComman
     send_cmd->used = 1;
     send_cmd->version = 1;
 
-    sgl.addr = &send_cmd;
+    sgl.addr = (uint64_t)send_cmd;
     sgl.length = sizeof(rdmaCommand);
     
     wr.num_sge = 1;
@@ -374,7 +393,8 @@ static int rdmaSendCommand( rdmaContext *ctx,struct rdma_cm_id *cmid, rdmaComman
     ret = ibv_post_send(cmid->qp, &wr, &bad_wr);
     if( ret ){
         ret = REDIS_ERR;
-    }
+    }else
+        ret = REDIS_OK;
     return ret;
 }
 /* synchronize receive buffer of current node to the remote node */
@@ -398,9 +418,10 @@ static int syncRecvBuffer( rdmaContext *ctx, struct rdma_cm_id *cmid){
  * return total number of reads or REDIS_ERR when timeout
  */
 static void redisRdmaFree(void *privctx){
-    rdmaContext *ctx = (rdmaContext *)(privctx);
+    if( !privctx )
+        return;
 
-    if( !ctx ) return;
+    rdmaContext *ctx = (rdmaContext *)(privctx);
     if(ibv_destroy_cq(ctx->cq))
         printf("Redis client destroy completion queue failed:%s\n", strerror(errno));
     rdmaDestroyIOBuffer(ctx);
@@ -417,6 +438,7 @@ static void redisRdmaClose( redisContext *c ){
     rdma_disconnect(cmid);
     rdmaHandleCq(ctx);
     redisRdmaFree(ctx);
+    c->privctx = NULL;
     if(ibv_destroy_qp(cmid->qp))
         printf("Redis client destroy qp failed:%s\n", strerror(errno));
     if(rdma_destroy_id(cmid))
@@ -441,7 +463,7 @@ void redisRdmaAsyncRead(redisAsyncContext *ac) {
      assert("hiredis async mechanism can't work with RDMA" == NULL);
  }
  
-int redisRdmaRead(redisContext *c, char *buf, size_t buflen){
+ssize_t redisRdmaRead(redisContext *c, char *buf, size_t buflen){
     rdmaContext *ctx = (rdmaContext *)(c->privctx);
     long timeout = 0;
     long start = redisNow();
@@ -526,11 +548,13 @@ static int ibVerbsWrite(rdmaContext *ctx, size_t write_len){
     wr.wr_id = 0;
     wr.imm_data = htonl(0);
 
-    wr.wr.rdma.remote_addr = ctx->remote_buffer + offset;
+    wr.wr.rdma.remote_addr = (uint64_t)ctx->remote_buffer + offset;
     wr.wr.rdma.rkey = ctx->remote_key;
     
     wr.opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
-    wr.send_flags |= IBV_SEND_SIGNALED; //todo::selective signaled
+    //wr.send_flags |= IBV_SEND_SIGNALED; 
+    //selective signaled
+    wr.send_flags = ((++ctx->send_ops) % REDIS_MAX_SGE) ? 0 : IBV_SEND_SIGNALED; 
 
     ret = ibv_post_send( cmid->qp, &wr, &bad_wr );
     if( ret ){
@@ -548,7 +572,6 @@ static int ibVerbsWrite(rdmaContext *ctx, size_t write_len){
  */ 
 ssize_t redisRdmaWrite(redisContext *c){
     rdmaContext *ctx = (rdmaContext *)(c->privctx);
-    struct rdma_cm_id *cmid = ctx->cmid;
     size_t data_len = hi_sdslen(c->obuf);
     size_t totalwrite = 0;
     long timeout = 0;
@@ -591,7 +614,7 @@ ssize_t redisRdmaWrite(redisContext *c){
 
 
 /* redisContext functions based on RDMA */
-static redisContextFuncs redisContextRdmaFuncs = {
+redisContextFuncs redisContextRdmaFuncs = {
     .close = redisRdmaClose,
     .free_privctx = redisRdmaFree,
     .async_read = redisRdmaAsyncRead,
@@ -678,7 +701,7 @@ static int rdmaHandleConnect(redisContext *c, struct rdma_cm_id *cm_id ){
 destroybuf:
     rdmaDestroyIOBuffer(ctx);
 freeqp:
-    rdma_destroy_qp(cm_id->qp);
+    ibv_destroy_qp(cm_id->qp);
 freeresources:
     if (ctx->cq)
         ibv_destroy_cq(ctx->cq);
@@ -742,7 +765,11 @@ static int redisRdmaHandleConnect(redisContext *c, int timeout){
             __redisSetError(c, REDIS_ERR_OTHER, errstr);
             break;
         }
-        rdma_ack_cm_event(cm_event);
+        if(rdma_ack_cm_event(cm_event) == -1){
+            snprintf(errstr, sizeof(errstr), "Redis client ack connect event failed:%s", rdma_event_str(cm_event->event));
+            __redisSetError(c, REDIS_ERR_OTHER, errstr); 
+            return REDIS_ERR;
+        }
     }
     return ret;
 }
@@ -775,8 +802,9 @@ int redisInitiateRdmaConnection(redisContext *c, const char *addr, int port,cons
     int rv = REDIS_OK;
     char _port[6];
     struct addrinfo hints, *clientinfo, *p;
-    long time_remain = 0, start = redisNow();
+    long time_remain = -1, start = redisNow();
     struct rdma_cm_id *cmid = NULL;
+    rdmaContext *ctx = NULL;
     struct sockaddr *sa;
     long total_time = -1;
 
@@ -795,7 +823,7 @@ int redisInitiateRdmaConnection(redisContext *c, const char *addr, int port,cons
         __redisSetError(c, REDIS_ERR_OTHER, "Redis client get timeout failed");
         return REDIS_ERR;
     }else if(total_time == -1){
-        total_time = INT_MAX;
+        total_time = INT32_MAX;
     }
 
     if (c->tcp.host != addr) {
@@ -822,7 +850,7 @@ int redisInitiateRdmaConnection(redisContext *c, const char *addr, int port,cons
         }
     }
     /* create connect event channel, create rdmaContext */
-    rdmaContext *ctx = hi_calloc(1, sizeof(rdmaContext));
+    ctx = hi_calloc(1, sizeof(rdmaContext));
     if( ctx == NULL ){
         __redisSetError(c, REDIS_ERR_OOM, "Redis client allocate rdmaContext structure failed");
         goto error;
@@ -840,7 +868,7 @@ int redisInitiateRdmaConnection(redisContext *c, const char *addr, int port,cons
         goto err_destroy_channel;
     }
 
-    if(rdma_create_id(channel,cmid,ctx, RDMA_PS_TCP)){
+    if(rdma_create_id(channel, &cmid,ctx, RDMA_PS_TCP)){
         __redisSetError(c, REDIS_ERR_OTHER, "Redis client rdma cmid create failed");
         goto err_destroy_channel;
     }
@@ -851,8 +879,13 @@ int redisInitiateRdmaConnection(redisContext *c, const char *addr, int port,cons
         if(rdma_resolve_addr(ctx->cmid, NULL, sa, 10)){
             continue;
         }
-        timeout = timeout - (redisNow() - start);
-        if( ((redisContextWaitReady( c, timeout)) == REDIS_OK) && (c->flags | REDIS_CONNECTED)){
+        time_remain = total_time - (redisNow() - start);
+        if( time_remain <= 0 ){
+           __redisSetError(c, REDIS_ERR_OTHER, "Redis client connection establishment timeout" ); 
+           rv = REDIS_ERR;
+           goto err_destroy_cmid;
+        }
+        if( ((redisContextWaitReady( c, time_remain)) == REDIS_OK) && (c->flags | REDIS_CONNECTED)){
             rv = REDIS_OK; 
             goto end;
         }
@@ -878,3 +911,26 @@ end:
 
     return rv;
 }
+
+int redisContextConnectRdma(redisContext *c, const char *addr, int port,
+                           const struct timeval *timeout){
+    return redisInitiateRdmaConnection(c, addr, port, timeout);
+}
+
+#else
+"Build error, RDMA related library should be run on linux platform"
+#endif
+#else
+int redisInitiateRdmaConnection(redisContext *c, const char *addr, int port, const struct timeval *timeout){
+    UNUSED(c);
+    UNUSED(addr);
+    UNUSED(port);
+    UNUSED(timeout);
+    __redisSetError(c, REDIS_ERR_OTHER, "Build with RDMA failed, need option declaration BUILD_RDMA=yes");
+    return EOPNOTSUPP;
+}
+int redisContextConnectRdma(redisContext *c, const char *addr, int port,
+                           const struct timeval *timeout){
+    return redisInitiateRdmaConnection(c, addr, port, timeout);
+}
+#endif

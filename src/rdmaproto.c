@@ -15,6 +15,18 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 
+void rdmaNetSetError(char *err, const char *fmt, ...)
+{
+    va_list ap;
+
+    if (!err) return;
+    va_start(ap, fmt);
+    vsnprintf(err, ANET_ERR_LEN, fmt, ap);
+    va_end(ap);
+}
+
+#ifdef USE_RDMA
+#ifdef __linux__
 //listen_channel对应的file descriptor交由ae事件管理器管理
 struct rdma_event_channel *listen_channel;
 
@@ -45,8 +57,12 @@ int rdmaServer( char *err, int port, char *bindaddr, int family, int backlog, st
         bindaddr = NULL;
 
     if ((rv = getaddrinfo(bindaddr,_port,&hints,&servinfo)) != 0) {
-        anetSetError(err, "%s", gai_strerror(rv));
+        rdmaNetSetError(err, "%s", gai_strerror(rv));
         return ANET_ERR;
+    } else if( !servinfo ){
+        rdmaNetSetError(err, "%s", "Redis server get addr info failed");
+        ret = ANET_ERR; 
+        goto end;
     }
     if(rdma_create_id(listen_channel, &listen_cmid, NULL, RDMA_PS_TCP )){
         return ANET_ERR;
@@ -61,16 +77,19 @@ int rdmaServer( char *err, int port, char *bindaddr, int family, int backlog, st
             serverLog(LL_DEBUG, "listening cm_id bind to addr %s:%d", addrpresent, ntohs(sin->sin_port));
         }
         else if(ss.ss_family == AF_INET6){
-            struct sockaddr_in6 *sin6 = (struct sockaddr_in *)(p->ai_addr);
+            struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)(p->ai_addr);
             inet_ntop(AF_INET, &sin6->sin6_addr, addrpresent, sizeof(addrpresent));
             serverLog(LL_DEBUG, "listening cm_id bind to addr %s:%d", addrpresent, ntohs(sin6->sin6_port));
         }
-        if(rdma_bind_addr(&listen_cmid, p->ai_addr )){
+        if(rdma_bind_addr(listen_cmid, p->ai_addr )){
+            serverLog(LL_WARNING, "Rdma Server bind addr failed");
             goto err;
         }
         if(rdma_listen(listen_cmid, backlog)){
+            serverLog(LL_WARNING, "Rdma Server create listening id failed");
             goto err;
         }
+        serverLog(LL_DEBUG, "Rdma server listening on port %d, listening qp number %d", ntohs(rdma_get_src_port(listen_cmid)), listen_cmid->port_num);
         *cmids = listen_cmid;
         goto end;
     }
@@ -78,6 +97,7 @@ int rdmaServer( char *err, int port, char *bindaddr, int family, int backlog, st
         goto err;
     }
 err:
+    serverLog(LL_WARNING, "Redis server initiate failed");
     if( listen_cmid )
         rdma_destroy_id(listen_cmid);
     ret = ANET_ERR;
@@ -151,3 +171,12 @@ int rdmaListenToPort( int port, socketFds *rfd, struct rdma_cm_id **listening_cm
     rfd->count++;
     return C_OK;
 }
+#else
+"Build error, RDMA related library should be run on linux platform"
+#endif
+#else
+int rdmaListenToPort( int port, socketFds *rfd, struct rdma_cm_id **listening_cmids ){
+    fprintf(stderr, "Build with RDMA failed, need option declaration BUILD_RDMA=yes");
+    return C_ERR;
+}
+#endif

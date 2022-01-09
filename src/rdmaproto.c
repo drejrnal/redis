@@ -10,8 +10,6 @@
  */
 
 #include "server.h"
-#include <rdma/rdma_cma.h>
-#include <infiniband/verbs.h>
 #include <arpa/inet.h>
 #include <netdb.h>
 
@@ -27,6 +25,8 @@ void rdmaNetSetError(char *err, const char *fmt, ...)
 
 #ifdef USE_RDMA
 #ifdef __linux__
+#include <rdma/rdma_cma.h>
+#include <infiniband/verbs.h>
 //listen_channel对应的file descriptor交由ae事件管理器管理
 struct rdma_event_channel *listen_channel;
 

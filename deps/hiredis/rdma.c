@@ -113,7 +113,7 @@ int redisSetFdBlocking(redisContext *c, int fd, int blocking);
 
 //此处的-999是为了防止计算msec时，结果溢出
 #define __MAX_SEC  (((LONG_MAX)-999)/1000)
-#define RDMA_DEFAULT_RECV_LEN 1024*1024
+#define RDMA_DEFAULT_RECV_LEN (1024*1024)
 /* 将struct timeval转换为long表示的msec */
 static int redisCommandTimeoutMsec(redisContext *c, long *result){
     const struct timeval *timeout = c->command_timeout;
@@ -470,8 +470,10 @@ ssize_t redisRdmaRead(redisContext *c, char *buf, size_t buflen){
 
     if (redisCommandTimeoutMsec(c, &timeout) == REDIS_ERR)
         return REDIS_ERR;
-    size_t avail = ctx->rx_offset - ctx->recv_offset;
-    while (redisNow() - start <= timeout){
+    size_t avail;
+    while ( 1 ){
+        if( redisNow() - start > timeout )
+            break;
         if(rdmaHandleCq(ctx) == REDIS_ERR){
             return REDIS_ERR;
         }
@@ -496,7 +498,7 @@ ssize_t redisRdmaRead(redisContext *c, char *buf, size_t buflen){
     
     if(ctx->recv_offset == ctx->recv_length)
         syncRecvBuffer(ctx, ctx->cmid);
-    return REDIS_OK;
+    return nread;
 
 
 /*
@@ -584,8 +586,10 @@ ssize_t redisRdmaWrite(redisContext *c){
 
     size_t avail = ctx->tx_length - ctx->tx_offset;
     long start = redisNow();
-    while (redisNow() - start < timeout){
+    while ( 1 ){
         while (avail == 0){
+            if( redisNow() - start > timeout )
+                goto external_loop;
             // waiting for 1 milliseconds for syncRecvBuffer called by server
             if (poll(rfd, 1, 1) < 0){
                 return REDIS_ERR;
@@ -605,6 +609,7 @@ ssize_t redisRdmaWrite(redisContext *c){
             break;
         avail = ctx->tx_length - ctx->tx_offset;
     }
+    external_loop:
     if( totalwrite == 0 ){
         __redisSetError(c, REDIS_ERR_TIMEOUT, "Redis client write data timeout");
         return REDIS_ERR;
@@ -780,20 +785,21 @@ static int redisContextWaitReady(redisContext *c, long timeout){
     fds[0].fd = ctx->conn_channel->fd;
     fds[0].events = POLLIN;
     long start = redisNow();
-    long now = start;
 
-    while (now - start <= timeout){
-        long remain_time = timeout - (now - start);
+    while ( 1 ){
+        long remain_time = timeout - (redisNow() - start);
+        if( remain_time <= 0 ) {
+            break;
+        }
         if (poll(fds, 1, remain_time) < 0){
             printf("Redis client poll waiting for handshake completion failed\n");
             return REDIS_ERR;
         }
-        if ((redisRdmaHandleConnect(c, remain_time))==REDIS_ERR ){
+        if ( redisRdmaHandleConnect(c, remain_time) ==REDIS_ERR ){
             return REDIS_ERR;
         }
         if (c->flags | REDIS_CONNECTED)
             return REDIS_OK;
-        now = redisNow();
     }
     return REDIS_ERR;
 }
@@ -801,12 +807,15 @@ static int redisContextWaitReady(redisContext *c, long timeout){
 int redisInitiateRdmaConnection(redisContext *c, const char *addr, int port,const struct timeval *timeout){
     int rv = REDIS_OK;
     char _port[6];
-    struct addrinfo hints, *clientinfo, *p;
+    struct addrinfo hints, *clientinfo = NULL, *p;
     long time_remain = -1, start = redisNow();
     struct rdma_cm_id *cmid = NULL;
     rdmaContext *ctx = NULL;
-    struct sockaddr *sa;
+    struct sockaddr_storage sa;
     long total_time = -1;
+
+    c->connection_type = REDIS_CONN_RDMA;
+    c->tcp.port = port;
 
     if (timeout){
         if (redisContextUpdateConnectTimeout(c, timeout) == REDIS_ERR){
@@ -819,7 +828,7 @@ int redisInitiateRdmaConnection(redisContext *c, const char *addr, int port,cons
         c->connect_timeout = NULL;
     }
 
-    if((redisContextTimeoutMsec(c, &total_time)) == REDIS_ERR){
+    if( redisContextTimeoutMsec(c, &total_time) == REDIS_ERR){
         __redisSetError(c, REDIS_ERR_OTHER, "Redis client get timeout failed");
         return REDIS_ERR;
     }else if(total_time == -1){
@@ -835,7 +844,7 @@ int redisInitiateRdmaConnection(redisContext *c, const char *addr, int port,cons
             return REDIS_ERR;
         }
     }
-    c->tcp.port = port;
+
     snprintf(_port, 6, "%d", port);
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_INET;
@@ -855,6 +864,7 @@ int redisInitiateRdmaConnection(redisContext *c, const char *addr, int port,cons
         __redisSetError(c, REDIS_ERR_OOM, "Redis client allocate rdmaContext structure failed");
         goto error;
     }
+    c->privctx = ctx;
 
     struct rdma_event_channel *channel = rdma_create_event_channel();
     if( channel == NULL ){
@@ -876,7 +886,7 @@ int redisInitiateRdmaConnection(redisContext *c, const char *addr, int port,cons
     for( p = clientinfo; p!=NULL; p = p->ai_next ){
         /* call rdma_resolve_addr */
         memcpy(&sa, p->ai_addr, p->ai_addrlen);
-        if(rdma_resolve_addr(ctx->cmid, NULL, sa, 10)){
+        if(rdma_resolve_addr(ctx->cmid, NULL, (struct sockaddr*)(&sa), 10)){
             continue;
         }
         time_remain = total_time - (redisNow() - start);
@@ -885,7 +895,7 @@ int redisInitiateRdmaConnection(redisContext *c, const char *addr, int port,cons
            rv = REDIS_ERR;
            goto err_destroy_cmid;
         }
-        if( ((redisContextWaitReady( c, time_remain)) == REDIS_OK) && (c->flags | REDIS_CONNECTED)){
+        if( ( redisContextWaitReady(c, time_remain) == REDIS_OK) && (c->flags | REDIS_CONNECTED)){
             rv = REDIS_OK; 
             goto end;
         }

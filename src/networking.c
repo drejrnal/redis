@@ -1153,11 +1153,12 @@ void acceptRdmaHandler( aeEventLoop *el, int fd, void *privdata, int mask ){
         ret = netRdmaAccept(server.neterr, fd, cip, sizeof(cip), &cport, &conn_cmid);
         if( ret == ANET_ERR ){
             if(errno != EWOULDBLOCK)
-                serverLog(LL_WARNING,"Accept client connection: %s", server.neterr);
+                serverLog(LL_WARNING,"Accept client connection: %s", strerror(errno));
             return;
         }else if( ret == ANET_OK ){
             continue;
         }
+        //anetNonBlock( server.neterr, ret );
         anetCloexec(ret);
         serverLog(LL_DEBUG, "Accept connection from %s:%d", cip, cport);
         acceptCommonHandler(connCreateAcceptedRdma(ret, conn_cmid), 0, cip);
